@@ -82,6 +82,8 @@ DEFAULT_HEADERS = [
     "Expense Acc",
     "Account Number",
     "Paid by",
+    "Comments",
+    "Checked",
 ]
 
 
@@ -267,6 +269,8 @@ def rows_for_receipt(text: str, image_path: str) -> List[dict]:
                 "Expense Acc": 5008,
                 "Account Number": "Stock: Other Food/Toppings",
                 "Paid by": "TopBun - Cash",
+                "Comments": "",
+                "Checked": "x"
             }
         )
 
