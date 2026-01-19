@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+Lidl receipt -> bookkeeping rows (Top Bun)
+
+What this script does
+---------------------
+- OCRs Lidl receipt images (via Tesseract + pytesseract).
+- For each receipt image it writes THREE rows to Excel:
+    0.0% VAT, 13.5% VAT, 23.0% VAT
+
+- Fields:
+    Date:
+        - Read from receipt in DD/MM/YY or DD.MM.YY
+        - Written to Excel as MM/DD/YY
+    Vendor:
+        - "Lidl"
+    Invoice Number:
+        - Image file name (not the folder)
+    TB Reference:
+        - Blank
+    VAT:
+        - "0.0%", "13.5%", "23.0%"
+    Invoice amount excl. VAT:
+        - For each VAT rate, uses the taxable amount beside that VAT line.
+        - For 0.0% row: taxable - DRS (Total Deposits paid), minimum 0.00.
+    VAT 1:
+        - VAT amount from receipt (2nd number on VAT line).
+    DRS:
+        - If "Total Deposits paid" (or "Deposits paid") exists:
+             that amount on the 0.0% row
+          otherwise 0.00.
+    Total:
+        - 0.0% row: (Invoice amount excl. VAT) + (VAT 1) + (DRS)
+        - 13.5% row: taxable amount (first number after 13.5% VAT)
+        - 23.0% row: taxable amount (first number after 23.0% VAT)
+    Description:
+        - "Food"
+    Expense Acc:
+        - 5008
+    Account Number:
+        - "Stock: Other Food/Toppings"
+    Paid by:
+        - "TopBun - Cash"
+
+- Tries to follow column order from SAMPLE.xlsx if provided.
+
+Usage examples
+--------------
+python lidl_receipts_to_excel.py ^
+  --images "C:\Users\SOHalloran\Downloads\lidlreceipts\*.jpg" "C:\Users\SOHalloran\Downloads\lidlreceipts\*.png" ^
+  --out "C:\Users\SOHalloran\Downloads\LidlExcel\lidl_output.xlsx" ^
+  --sample "C:\Users\SOHalloran\Downloads\SAMPLE.xlsx" ^
+  --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+Requirements
+------------
+pip install pillow pytesseract pandas openpyxl
+Tesseract OCR installed (Windows: UB-Mannheim build is ideal).
+"""
+
+import argparse
+import glob
+import os
+import re
+from datetime import datetime
+from typing import Dict, Tuple, Optional, List
+
+import pandas as pd
+from PIL import Image, ImageOps, ImageFilter
+
+try:
+    import pytesseract
+except ImportError as e:
+    raise SystemExit("Missing dependency 'pytesseract'. Install with: pip install pytesseract") from e
+
+
+# ---------- Config ----------
+
+VAT_RATES: List[float] = [0.0, 13.5, 23.0]
+
+DEFAULT_HEADERS = [
+    "Date",
+    "Vendor",
+    "Invoice Number",
+    "TB Reference",
+    "VAT",
+    "Invoice amount excl. VAT",
+    "VAT 1",
+    "DRS",
+    "Total",
+    "Description",
+    "Expense Acc",
+    "Account Number",
+    "Paid by",
+]
+
+
+# ---------- OCR helpers ----------
+
+def normalise_image_for_ocr(img: Image.Image) -> Image.Image:
+    """Convert to grayscale, auto-contrast, sharpen slightly."""
+    g = ImageOps.grayscale(img)
+    g = ImageOps.autocontrast(g)
+    g = g.filter(ImageFilter.SHARPEN)
+    return g
+
+
+def ocr_text(path: str, tesseract_cmd: Optional[str] = None) -> str:
+    """Run Tesseract OCR on an image file."""
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    img = Image.open(path)
+    img = normalise_image_for_ocr(img)
+    text = pytesseract.image_to_string(img, config="--oem 1 --psm 6")
+    return text
+
+
+# ---------- Parsing helpers ----------
+
+def find_date(text: str) -> Optional[str]:
+    """
+    Find date in receipt text.
+    Supports:
+      "Date: 31/08/25"
+      "31.08.25"
+    Returns MM/DD/YY string or None.
+    """
+    m = re.search(r"Date[:\s]*([0-3]\d/[01]\d/\d\d)", text, re.IGNORECASE)
+    if not m:
+        dots = re.findall(r"([0-3]\d\.[01]\d\.\d\d)", text)
+        if dots:
+            ddmmyy = dots[-1].replace(".", "/")
+        else:
+            return None
+    else:
+        ddmmyy = m.group(1)
+
+    try:
+        dt = datetime.strptime(ddmmyy, "%d/%m/%y")
+        return dt.strftime("%m/%d/%y")
+    except ValueError:
+        return None
+
+
+VAT_LINE_RE = re.compile(
+    r"""
+    ^\s*[A-Z]?\s*                  # Optional VAT group letter (A/B/C)
+    (?P<rate>\d{1,2}\.?\d?)\s*%    # e.g. 0.0, 13.5, 23.0
+    \s*VAT
+    \s+(?P<taxable>\d+\.\d{2})     # taxable amount
+    \s+(?P<vat>\d+\.\d{2})         # VAT amount
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
+
+def parse_vat_map(text: str) -> Dict[float, Tuple[float, float]]:
+    """
+    Parse VAT summary lines into a map:
+      { rate: (taxable_amount, vat_amount) }
+    """
+    out: Dict[float, Tuple[float, float]] = {}
+    for m in VAT_LINE_RE.finditer(text):
+        try:
+            rate = float(m.group("rate"))
+        except ValueError:
+            continue
+
+        taxable = float(m.group("taxable"))
+        vat = float(m.group("vat"))
+
+        if rate in (23, 23.0):
+            rate = 23.0
+        elif rate in (0, 0.0):
+            rate = 0.0
+        elif rate in (13, 13.0, 13.5):
+            rate = 13.5
+
+        out[rate] = (taxable, vat)
+
+    return out
+
+
+def parse_deposits(text: str) -> float:
+    """
+    Find DRS / deposit total on the receipt.
+    Looks for:
+      "Total Deposits paid"
+      or "Deposits paid"
+    Returns 0.0 if not found.
+    """
+    m_total = re.search(
+        r"Total\s+Deposits\s+paid.*?(\d+\.\d{2})",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_total:
+        return float(m_total.group(1))
+
+    m = re.search(
+        r"Deposits\s+paid.*?(\d+\.\d{2})",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        return float(m.group(1))
+
+    return 0.0
+
+
+def rows_for_receipt(
+    text: str,
+    image_name: str,
+    default_account_number: str = "Stock: Other Food/Toppings",
+):
+    """
+    Given OCR text for a single Lidl receipt, build three output rows:
+    0.0%, 13.5%, 23.0%.
+    """
+    date_str = find_date(text) or ""
+    vat_map = parse_vat_map(text)
+    drs = parse_deposits(text)
+
+    rows = []
+
+    for rate in VAT_RATES:
+        taxable, vat = vat_map.get(rate, (0.0, 0.0))
+
+        inv_ex_vat = taxable
+        drs_cell = 0.0
+
+        if rate == 0.0:
+            inv_ex_vat = max(taxable - drs, 0.0)
+            drs_cell = drs
+
+        if rate == 0.0:
+            total = inv_ex_vat + vat + drs_cell
+        elif rate == 23.0:
+            total = taxable
+        else:  # 13.5%
+            total = taxable
+
+        row = {
+            "Date": date_str,
+            "Vendor": "Lidl",
+            "Invoice Number": os.path.basename(image_name),
+            "TB Reference": "",
+            "VAT": f"{rate:.1f}%",
+            "Invoice amount excl. VAT": round(inv_ex_vat, 2),
+            "VAT 1": round(vat, 2),
+            "DRS": round(drs_cell, 2),
+            "Total": round(total, 2),
+            "Description": "Food",
+            "Expense Acc": 5008,
+            "Account Number": default_account_number,
+            "Paid by": "TopBun - Cash",
+        }
+        rows.append(row)
+
+    return rows
+
+
+def load_headers_from_sample(sample_path: Optional[str]) -> Optional[list]:
+    """If SAMPLE.xlsx is provided, use its column order."""
+    if not sample_path or not os.path.exists(sample_path):
+        return None
+    try:
+        df = pd.read_excel(sample_path, engine="openpyxl")
+        cols = list(df.columns)
+        return cols or None
+    except Exception:
+        return None
+
+
+# ---------- Main ----------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--images",
+        nargs="+",
+        required=True,
+        help="Image globs and/or file paths. E.g. C:\\path\\*.jpg C:\\path\\*.png",
+    )
+    ap.add_argument(
+        "--out",
+        required=True,
+        help="Output Excel file path.",
+    )
+    ap.add_argument(
+        "--sample",
+        default=None,
+        help="Optional SAMPLE.xlsx path to copy column order.",
+    )
+    ap.add_argument(
+        "--tesseract-cmd",
+        default=None,
+        help="Path to tesseract.exe if not on PATH.",
+    )
+    args = ap.parse_args()
+
+    files = []
+    for pattern in args.images:
+        files.extend(glob.glob(pattern))
+    files = [f for f in dict.fromkeys(files) if os.path.isfile(f)]
+
+    if not files:
+        raise SystemExit("No images found for the given pattern(s).")
+
+    all_rows = []
+    for fpath in files:
+        try:
+            text = ocr_text(fpath, tesseract_cmd=args.tesseract_cmd)
+        except Exception as e:
+            print(f"[WARN] OCR failed for {fpath}: {e}")
+            continue
+
+        rows = rows_for_receipt(text, fpath)
+        all_rows.extend(rows)
+
+    if not all_rows:
+        raise SystemExit("No rows produced. Check OCR/Tesseract and receipt layout.")
+
+    headers = load_headers_from_sample(args.sample) or DEFAULT_HEADERS
+
+    for h in DEFAULT_HEADERS:
+        if h not in headers:
+            headers.append(h)
+
+    df = pd.DataFrame(all_rows)
+
+    for col in headers:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[headers]
+
+    out_path = os.path.abspath(args.out)
+    out_dir = os.path.dirname(out_path)
+    os.makedirs(out_dir, exist_ok=True)
+
+    df.to_excel(out_path, index=False, engine="openpyxl")
+    print(f"Wrote {len(df)} rows to: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
