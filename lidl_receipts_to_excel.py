@@ -146,7 +146,7 @@ def find_date_mmddyy(text: str) -> str:
     except ValueError:
         return ""
 
-    def find_date_ddmmyyyy(text: str) -> str:
+def find_date_ddmmyyyy(text: str) -> str:
     """Find receipt date and return as DD.MM.YYYY (string). Blank if not found."""
     text = _clean_ocr(text)
 
@@ -161,12 +161,12 @@ def find_date_mmddyy(text: str) -> str:
         return ""
 
     raw = raw.replace(".", "/")
+        
     try:
         dt = datetime.strptime(raw, "%d/%m/%y")
         return dt.strftime("%d.%m.%Y")
     except ValueError:
         return ""
-
 
 
 # VAT summary line examples in Lidl receipts (OCR varies):
