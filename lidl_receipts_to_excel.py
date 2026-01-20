@@ -11,17 +11,15 @@ pip install pillow pytesseract pandas openpyxl
 Also requires Tesseract OCR installed:
 - Windows: install Tesseract, then either add it to PATH or pass
   --tesseract-cmd "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
-- macOS: brew install tesseract
-- Linux: sudo apt-get install tesseract-ocr
 
 Usage
 -----
-python lidl_receipts_to_excel.py --images "C:\\Receipts\\*.png" "C:\\Receipts\\*.jpg" \
+python lidl_receipts_to_excel.py --images "C:\\Receipts\\*.png" "C:\\Receipts\\*.jpg" \ "C:\\Receipts\\*.jpeg" \
   --out "C:\\Receipts\\lidl_output.xlsx" \
   --sample "C:\\Receipts\\Sample.xlsx" \
   --tesseract-cmd "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 
-Mapping rules implemented (per user spec)
+Mapping rules implemented 
 -----------------------------------------
 - Date: read from receipt as DD/MM/YY or DD.MM.YY, written as MM/DD/YY
 - Vendor: Lidl
@@ -56,6 +54,7 @@ import os
 import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import pandas as pd
 from PIL import Image, ImageFilter, ImageOps
@@ -117,7 +116,7 @@ def _clean_ocr(text: str) -> str:
     # Normalize decimal separators and spacing
     text = text.replace(",", ".")
 
-    # Sometimes OCR drops the dot in 23.0 -> 230; try to reduce that risk is hard.
+    # Sometimes OCR drops the dot in 23.0 -> 230;
     # We mainly rely on the presence of '% VAT' as anchor.
 
     return text
@@ -151,7 +150,7 @@ def find_date_mmddyy(text: str) -> str:
 #   A  0.0% VAT   64.63   0.00   64.63
 #   C 23.0% VAT    2.48   0.46    2.94
 # Some OCR outputs only 2 amounts (often Total then VAT).
-# We treat the **2nd amount** as VAT (VAT.1) per user spec, and prefer the
+# We treat the **2nd amount** as VAT (VAT.1), and prefer the
 # **3rd amount** as Total when present.
 VAT_LINE_RE = re.compile(
     r"^\s*(?:[A-Z]\s+)?(?P<rate>\d{1,2}(?:\.\d)?)\s*%\s*VAT\s+"
@@ -293,16 +292,25 @@ def load_headers_from_sample(sample_path: Optional[str]) -> Optional[List[str]]:
 
 
 def expand_image_patterns(patterns: List[str]) -> List[str]:
-    files: List[str] = []
-    for p in patterns:
-        files.extend(glob.glob(p))
-    # de-dup preserving order
+    files = []
+
+    for pattern in patterns:
+        p = Path(pattern)
+        folder = p.parent if p.parent != Path("") else Path(".")
+        files.extend(folder.glob("*.png"))
+        files.extend(folder.glob("*.jpg"))
+        files.extend(folder.glob("*.jpeg"))
+
+    # de-duplicate while preserving order
     out: List[str] = []
     seen = set()
+
     for f in files:
-        if f not in seen and os.path.isfile(f):
-            out.append(f)
-            seen.add(f)
+        f_str = str(f)
+        if f_str not in seen and os.path.isfile(f_str):
+            out.append(f_str)
+            seen.add(f_str)
+
     return out
 
 
